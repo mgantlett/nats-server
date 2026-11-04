@@ -1108,13 +1108,19 @@ func (a *Account) addClient(c *client) int {
 
 // For registering clusters for remote leafnodes.
 // We only register as the hub.
-func (a *Account) registerLeafNodeCluster(cluster string) {
+func (a *Account) registerLeafNodeCluster(c *client, cluster string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if _, ok := a.clients[c]; !ok {
+		return
+	}
 	if a.leafClusters == nil {
 		a.leafClusters = make(map[string]uint64)
 	}
 	a.leafClusters[cluster]++
+	if c.leaf != nil {
+		c.leaf.clusterRegistered = true
+	}
 }
 
 // Check to see if we already have this cluster registered.
@@ -1175,8 +1181,9 @@ func (a *Account) removeClient(c *client) int {
 	} else if c.kind == LEAF {
 		a.nleafs--
 		// Need to do cluster accounting here.
-		// Do cluster accounting if we are a hub.
-		if c.isHubLeafNode() {
+		// Do cluster accounting if we are a hub and registered the cluster.
+		if c.leaf != nil && c.leaf.clusterRegistered {
+			c.leaf.clusterRegistered = false
 			cluster := c.remoteCluster()
 			if count := a.leafClusters[cluster]; count > 1 {
 				a.leafClusters[cluster]--

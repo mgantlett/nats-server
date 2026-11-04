@@ -72,9 +72,12 @@ type leaf struct {
 	remote *leafNodeCfg
 	// isSpoke tells us what role we are playing.
 	// Used when we receive a connection but otherside tells us they are a hub.
-	isSpoke bool
+	isSpoke atomic.Bool
 	// remoteCluster is when we are a hub but the spoke leafnode is part of a cluster.
-	remoteCluster string
+	remoteCluster atomic.Pointer[string]
+	// clusterRegistered tracks whether this connection incremented its account's
+	// leafClusters map; guarded by the Account lock.
+	clusterRegistered bool
 	// remoteServer holds onto the remote server's name or ID.
 	remoteServer string
 	// domain name of remote server
@@ -127,11 +130,19 @@ func (c *client) isSolicitedLeafNode() bool {
 // Returns true if this is a solicited leafnode and is not configured to be treated as a hub or a receiving
 // connection leafnode where the otherside has declared itself to be the hub.
 func (c *client) isSpokeLeafNode() bool {
-	return c.kind == LEAF && c.leaf != nil && c.leaf.isSpoke
+	return c.kind == LEAF && c.leaf != nil && c.leaf.isSpoke.Load()
 }
 
 func (c *client) isHubLeafNode() bool {
-	return c.kind == LEAF && c.leaf != nil && !c.leaf.isSpoke
+	return c.kind == LEAF && c.leaf != nil && !c.leaf.isSpoke.Load()
+}
+
+func (l *leaf) setRemoteCluster(cluster string) {
+	if cluster == _EMPTY_ {
+		l.remoteCluster.Store(nil)
+		return
+	}
+	l.remoteCluster.Store(&cluster)
 }
 
 func (c *client) isIsolatedLeafNode() bool {
@@ -1435,7 +1446,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 		c.acc = acc
 		c.setPermissions(c.leafRemoteDenyPermissions())
 		if !c.leaf.remote.Hub {
-			c.leaf.isSpoke = true
+			c.leaf.isSpoke.Store(true)
 		}
 		tlsFirst = remote.TLSHandshakeFirst
 		infoTimeout = remote.FirstInfoTimeout
@@ -1818,7 +1829,7 @@ func (c *client) processLeafnodeInfo(info *Info) {
 			c.leaf.remoteServer = info.Name
 		}
 		c.leaf.remoteDomain = info.Domain
-		c.leaf.remoteCluster = info.Cluster
+		c.leaf.setRemoteCluster(info.Cluster)
 		// We send the protocol version in the INFO protocol.
 		// Keep track of it, so we know if this connection supports message
 		// tracing for instance.
@@ -2091,7 +2102,7 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 	myRemoteDomain := c.leaf.remoteDomain
 	mySrvName := c.leaf.remoteServer
 	remoteAccName := c.leaf.remoteAccName
-	myClustName := c.leaf.remoteCluster
+	myClustName := c.remoteCluster()
 	remote := c.leaf.remote
 	solicited := remote != nil
 	c.mu.Unlock()
@@ -2111,7 +2122,7 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 			// We have code for the loop detection elsewhere, which also delays
 			// attempt to reconnect.
 			if !ol.isSolicitedLeafNode() && ol.leaf.remoteServer == srvName &&
-				ol.leaf.remoteCluster == clusterName && ol.acc.Name == accName &&
+				ol.remoteCluster() == clusterName && ol.acc.Name == accName &&
 				remoteAccName != _EMPTY_ && ol.leaf.remoteAccName == remoteAccName {
 				old = ol
 			}
@@ -2438,12 +2449,12 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 
 	// If the other side has declared itself a hub, so we will take on the spoke role.
 	if proto.Hub {
-		c.leaf.isSpoke = true
+		c.leaf.isSpoke.Store(true)
 	}
 
 	// The soliciting side is part of a cluster.
 	if proto.Cluster != _EMPTY_ {
-		c.leaf.remoteCluster = proto.Cluster
+		c.leaf.setRemoteCluster(proto.Cluster)
 	}
 
 	c.leaf.remoteDomain = proto.Domain
@@ -2461,8 +2472,10 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 		}
 	}
 
-	// Set the Ping timer
-	c.setFirstPingTimer()
+	// Set the Ping timer if the connection has not already been closed.
+	if !c.isClosed() {
+		c.setFirstPingTimer()
+	}
 
 	// If we received pub deny permissions from the other end, merge with existing ones.
 	// These are the remote's deny_imports: resolve account scoped mapping functions from its perspective.
@@ -2491,7 +2504,7 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 
 	// Register the cluster, even if empty, as long as we are acting as a hub.
 	if !proto.Hub {
-		acc.registerLeafNodeCluster(proto.Cluster)
+		acc.registerLeafNodeCluster(c, proto.Cluster)
 	}
 
 	// Add in the leafnode here since we passed through auth at this point.
@@ -2584,12 +2597,15 @@ func (s *Server) checkInternalSyncConsumers(acc *Account) {
 	}
 }
 
-// Returns the remote cluster name. This is set only once so does not require a lock.
+// Returns the remote cluster name.
 func (c *client) remoteCluster() string {
 	if c.leaf == nil {
 		return _EMPTY_
 	}
-	return c.leaf.remoteCluster
+	if rc := c.leaf.remoteCluster.Load(); rc != nil {
+		return *rc
+	}
+	return _EMPTY_
 }
 
 // Sends back an info block to the soliciting leafnode to let it know about
@@ -2717,7 +2733,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	}
 
 	// Now walk the results and add them to our smap
-	rc := c.leaf.remoteCluster
+	rc := c.remoteCluster()
 	c.leaf.smap = make(map[string]int64)
 	for _, sub := range subs {
 		// Don't advertise interest from leafnodes to this isolated leafnode connection.

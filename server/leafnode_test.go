@@ -1688,6 +1688,103 @@ func TestLeafNodeAcceptSideClosedDuringConnectNotLeaked(t *testing.T) {
 	require_Equal(t, acc.NumLeafNodes(), 0)
 }
 
+// https://github.com/nats-io/nats-server/issues/8826
+func TestLeafNodeAuthTimeoutDuringConnectRemoteClusterRace(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+
+	acc := s.GlobalAccount()
+
+	steadyCli, steadySrv := net.Pipe()
+	defer steadyCli.Close()
+	defer steadySrv.Close()
+	go func() { _, _ = io.Copy(io.Discard, steadyCli) }()
+
+	steady := &client{
+		kind: LEAF,
+		srv:  s,
+		nc:   steadySrv,
+		acc:  acc,
+		leaf: &leaf{},
+	}
+	steady.initClient()
+	steady.flags.set(skipFlushOnClose)
+	steady.cid = 199_999
+	if prev := acc.addClient(steady); prev == 0 {
+		s.incActiveAccounts()
+	}
+	require_NoError(t, steady.processLeafNodeConnect(s, []byte(`{"cluster":"steady"}`), _EMPTY_))
+	require_True(t, acc.hasLeafNodeCluster("steady"))
+
+	for i := range 50 {
+		clientConn, serverConn := net.Pipe()
+		doneRead := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(io.Discard, clientConn)
+			close(doneRead)
+		}()
+
+		c := &client{
+			kind: LEAF,
+			srv:  s,
+			nc:   serverConn,
+			acc:  acc,
+			leaf: &leaf{},
+		}
+		c.initClient()
+		c.flags.set(skipFlushOnClose)
+		c.cid = uint64(200_000 + i)
+
+		if prev := acc.addClient(c); prev == 0 {
+			s.incActiveAccounts()
+		}
+
+		payload := []byte(`{"cluster":"xyz"}`)
+		if i%2 == 1 {
+			payload = []byte(`{"is_hub":true,"cluster":"xyz"}`)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			<-start
+			c.authTimeout()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = c.processLeafNodeConnect(s, payload, _EMPTY_)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 100 {
+				_ = c.remoteCluster()
+				_ = c.isHubLeafNode()
+				_ = c.isSpokeLeafNode()
+			}
+		}()
+		close(start)
+		wg.Wait()
+
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+		<-doneRead
+
+		require_Equal(t, s.NumLeafNodes(), 1)
+		require_Equal(t, acc.NumLeafNodes(), 1)
+		require_False(t, acc.hasLeafNodeCluster("xyz"))
+		require_True(t, acc.hasLeafNodeCluster("steady"))
+	}
+
+	steady.closeConnection(ClientClosed)
+	require_Equal(t, s.NumLeafNodes(), 0)
+	require_Equal(t, acc.NumLeafNodes(), 0)
+	require_False(t, acc.hasLeafNodeCluster("steady"))
+}
+
 func TestLeafNodePubAllowedPruning(t *testing.T) {
 	c := &client{}
 	c.setPermissions(&Permissions{Publish: &SubjectPermission{Allow: []string{"foo"}}})
@@ -12601,7 +12698,9 @@ func BenchmarkLeafNodeIsolatedSpokeInitialSubs(b *testing.B) {
 				require_NoError(b, acc.sl.Insert(&subscription{client: downstream, subject: fmt.Appendf(nil, "leaf.%d", i), leaf: true}))
 			}
 
-			c := newClient(LEAF, &leaf{isSpoke: true, isolated: true})
+			sp := &leaf{isolated: true}
+			sp.isSpoke.Store(true)
+			c := newClient(LEAF, sp)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
@@ -14705,7 +14804,7 @@ func TestLeafNodeImportCycleAcrossDynamicHubClusterAndLeafDoesNotLoop(t *testing
 	leaf.mu.Lock()
 	for _, l := range leaf.leafs {
 		l.mu.Lock()
-		rc, rs := l.leaf.remoteCluster, l.leaf.remoteServer
+		rc, rs := l.remoteCluster(), l.leaf.remoteServer
 		l.mu.Unlock()
 		if rc != _EMPTY_ {
 			leaf.mu.Unlock()
